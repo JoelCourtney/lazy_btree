@@ -383,8 +383,8 @@ impl<'a, T> VecSlicer<'a, T> {
 
 impl<T> Drop for VecSlicer<'_, T> {
     fn drop(&mut self) {
-        assert_eq!(self.current_index, self.vec.len());
-        assert_eq!(self.slice_start, self.vec.len());
+        debug_assert_eq!(self.current_index, self.vec.len());
+        debug_assert_eq!(self.slice_start, self.vec.len());
         unsafe {
             self.vec.set_len(0);
         }
@@ -399,8 +399,8 @@ struct SliceThief<T> {
 
 impl<T> SliceThief<T> {
     fn peek_first(&self) -> &T {
-        assert_ne!(self.len, 0, "Cannot peek first element of empty slice");
-        assert_eq!(
+        debug_assert_ne!(self.len, 0, "Cannot peek first element of empty slice");
+        debug_assert_eq!(
             self.current, 0,
             "Cannot peek first element when it has already been consumed."
         );
@@ -408,8 +408,8 @@ impl<T> SliceThief<T> {
     }
 
     fn peek_last(&self) -> &T {
-        assert_ne!(self.len, 0, "Cannot peek last element of empty slice");
-        assert_ne!(
+        debug_assert_ne!(self.len, 0, "Cannot peek last element of empty slice");
+        debug_assert_ne!(
             self.current, self.len,
             "Cannot peek last element when it has already been consumed."
         );
@@ -419,7 +419,7 @@ impl<T> SliceThief<T> {
 
 impl<T> Drop for SliceThief<T> {
     fn drop(&mut self) {
-        assert_eq!(self.current, self.len);
+        debug_assert_eq!(self.current, self.len);
     }
 }
 
@@ -577,71 +577,82 @@ fn process_buffer<I, K, V>(
     branch_builder: fn(I) -> (Branch<K, V>, *mut ArrayVec<I, B>),
     item_comparator: fn(&I, &I) -> Ordering,
 ) -> Vec<Branch<K, V>> {
-    let mut elements_vec = take(&mut *elements_ref);
-    let total_count = buffer.len() + elements_vec.len();
-    let mut elements = elements_vec.drain(..);
-    let mut buffer = buffer.peekable();
+    let total_count = buffer.len() + elements_ref.len();
 
-    let mut next_element = elements.next();
-    let mut next_insert = buffer.next();
-
-    let mut counter = 0;
-
-    let mut result = vec![];
-    let mut push_to = &mut **elements_ref as *mut ArrayVec<I, B>;
-    let mut apply = |item| {
-        if (counter + 1) % (B / 2 + 1) == 0 && total_count - counter > B / 2 {
-            let (new_branch, new_push_to) = branch_builder(item);
-            push_to = new_push_to;
-            result.push(new_branch);
-        } else {
-            unsafe { &mut *push_to }.push(item)
-        }
-
-        counter += 1;
-    };
-
-    while let Some(ne) = &next_element
-        && let Some(ni) = &next_insert
-    {
-        match item_comparator(ne, ni) {
-            Ordering::Less => {
-                apply(next_element.take().unwrap());
-                next_element = elements.next();
-            }
-            Ordering::Greater => {
-                let mut to_apply = next_insert.take().unwrap();
-                while let Some(peek) = buffer.peek()
-                    && item_comparator(&to_apply, peek).is_eq()
-                {
-                    to_apply = buffer.next().unwrap();
-                }
-                apply(to_apply);
-                next_insert = buffer.next();
-            }
-            Ordering::Equal => {
-                next_element = elements.next();
+    if total_count <= B && buffer.len() <= 2 {
+        for item in buffer {
+            match elements_ref.binary_search_by(|i| item_comparator(i, &item)) {
+                Ok(i) => elements_ref[i] = item,
+                Err(i) => elements_ref.insert(i, item),
             }
         }
-    }
+        vec![]
+    } else {
+        let mut elements_vec = take(&mut *elements_ref);
+        let mut elements = elements_vec.drain(..);
+        let mut buffer = buffer.peekable();
 
-    while let Some(ne) = next_element {
-        apply(ne);
-        next_element = elements.next();
-    }
+        let mut next_element = elements.next();
+        let mut next_insert = buffer.next();
 
-    while let Some(ni) = next_insert {
-        let mut to_apply = ni;
-        while let Some(peek) = buffer.peek()
-            && item_comparator(&to_apply, peek).is_eq()
+        let mut counter = 0;
+
+        let mut result = vec![];
+        let mut push_to = &mut **elements_ref as *mut ArrayVec<I, B>;
+        let mut apply = |item| {
+            if (counter + 1) % (B / 2 + 1) == 0 && total_count - counter > B / 2 {
+                let (new_branch, new_push_to) = branch_builder(item);
+                push_to = new_push_to;
+                result.push(new_branch);
+            } else {
+                unsafe { &mut *push_to }.push(item)
+            }
+
+            counter += 1;
+        };
+
+        while let Some(ne) = &next_element
+            && let Some(ni) = &next_insert
         {
-            to_apply = buffer.next().unwrap();
+            match item_comparator(ne, ni) {
+                Ordering::Less => {
+                    apply(next_element.take().unwrap());
+                    next_element = elements.next();
+                }
+                Ordering::Greater => {
+                    let mut to_apply = next_insert.take().unwrap();
+                    while let Some(peek) = buffer.peek()
+                        && item_comparator(&to_apply, peek).is_eq()
+                    {
+                        to_apply = buffer.next().unwrap();
+                    }
+                    apply(to_apply);
+                    next_insert = buffer.next();
+                }
+                Ordering::Equal => {
+                    next_element = elements.next();
+                }
+            }
         }
-        apply(to_apply);
-        next_insert = buffer.next();
-    }
 
-    result
+        while let Some(ne) = next_element {
+            apply(ne);
+            next_element = elements.next();
+        }
+
+        while let Some(ni) = next_insert {
+            let mut to_apply = ni;
+            while let Some(peek) = buffer.peek()
+                && item_comparator(&to_apply, peek).is_eq()
+            {
+                to_apply = buffer.next().unwrap();
+            }
+            apply(to_apply);
+            next_insert = buffer.next();
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]
