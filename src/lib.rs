@@ -1,9 +1,10 @@
 mod vec_slicer;
 
 use std::{
-    cell::{Cell, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     cmp::Ordering,
     collections::VecDeque,
+    iter::Peekable,
     mem::take,
     ops::{Deref, DerefMut},
 };
@@ -89,26 +90,14 @@ impl<K: Ord, V> Map<K, V> {
                 new_branches = new_array.process_branches(new_branches.drain(..));
 
                 search_result = match search_result {
-                    SearchResult::HeadOfBranch => {
-                        let search_new_array = |array: &mut ArrayVec<Branch<K, V>, B>| {
-                            let idx = array.binary_search_by(|b| b.key.cmp(key)).unwrap();
-                            &mut *array[idx].value as *mut _
-                        };
-                        match new_branches.binary_search_by(|b| b.key.cmp(key)) {
-                            Ok(_) => SearchResult::HeadOfBranch,
-                            Err(0) => SearchResult::Some(search_new_array(
-                                &mut new_array.elements.borrow_mut(),
-                            )),
-                            Err(i) => SearchResult::Some(search_new_array(
-                                &mut new_branches[i - 1]
-                                    .child
-                                    .array
-                                    .unwrap_internal_mut()
-                                    .elements
-                                    .borrow_mut(),
-                            )),
-                        }
-                    }
+                    SearchResult::HeadOfBranch => search_phantom_internal_node(
+                        new_branches.as_slice(),
+                        key,
+                        &*new_array.elements.borrow(),
+                        |b, key| b.key.cmp(key),
+                        |b| &*b.value,
+                        |arr| arr.unwrap_internal().elements.borrow(),
+                    ),
                     sr => sr,
                 };
 
@@ -140,9 +129,16 @@ enum Array<K, V> {
 }
 
 impl<K, V> Array<K, V> {
-    fn unwrap_internal_mut(&mut self) -> &mut InternalArray<K, V> {
+    fn unwrap_internal(&self) -> &InternalArray<K, V> {
         match self {
             Array::Internal(ia) => ia,
+            _ => unreachable!(),
+        }
+    }
+
+    fn unwrap_leaf(&self) -> &LeafArray<K, V> {
+        match self {
+            Array::Leaf(la) => la,
             _ => unreachable!(),
         }
     }
@@ -277,37 +273,19 @@ impl<K: Ord, V> Node<K, V> {
                             new_branches = ia.process_branches(new_branches.into_iter());
                         }
 
-                        match search_result {
-                            SearchResult::HeadOfBranch => {
-                                match new_branches.binary_search_by(|b| b.key.cmp(key)) {
-                                    Ok(_) => (SearchResult::HeadOfBranch, new_branches),
-                                    Err(0) => {
-                                        let elements = ia.elements.borrow();
-                                        match elements.binary_search_by(|b| b.key.cmp(key)) {
-                                            Ok(i) => (
-                                                SearchResult::Some(&*elements[i].value),
-                                                new_branches,
-                                            ),
-                                            _ => unreachable!(),
-                                        }
-                                    }
-                                    Err(i) => {
-                                        let elements = match &new_branches[i - 1].child.array {
-                                            Array::Internal(ia) => ia.elements.borrow(),
-                                            _ => unreachable!(),
-                                        };
-                                        let search_result =
-                                            match elements.binary_search_by(|b| b.key.cmp(key)) {
-                                                Ok(i) => SearchResult::Some(&*elements[i].value),
-                                                _ => unreachable!(),
-                                            };
-                                        drop(elements);
-                                        (search_result, new_branches)
-                                    }
-                                }
-                            }
-                            sr => (sr, new_branches),
-                        }
+                        let search_result = match search_result {
+                            SearchResult::HeadOfBranch => search_phantom_internal_node(
+                                new_branches.as_slice(),
+                                key,
+                                &*ia.elements.borrow(),
+                                |b, key| b.key.cmp(key),
+                                |b| &*b.value,
+                                |arr| arr.unwrap_internal().elements.borrow(),
+                            ),
+                            sr => sr,
+                        };
+
+                        (search_result, new_branches)
                     }
                 }
             }
@@ -321,29 +299,15 @@ impl<K: Ord, V> Node<K, V> {
                             .sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
                     }
                     let new_branches = la.process_buffer(buffer.drain(..));
-                    match new_branches.binary_search_by(|b| b.key.cmp(key)) {
-                        Ok(_) => (SearchResult::HeadOfBranch, new_branches),
-                        Err(0) => {
-                            let elements = la.elements.borrow();
-                            match elements.binary_search_by(|(k, _)| k.cmp(key)) {
-                                Ok(i) => (SearchResult::Some(&elements[i].1), new_branches),
-                                Err(_) => (SearchResult::None, new_branches),
-                            }
-                        }
-                        Err(i) => {
-                            let elements = match &new_branches[i - 1].child.array {
-                                Array::Leaf(la) => la.elements.borrow(),
-                                _ => unreachable!(),
-                            };
-                            let search_result = match elements.binary_search_by(|(k, _)| k.cmp(key))
-                            {
-                                Ok(i) => SearchResult::Some(&elements[i].1),
-                                Err(_) => SearchResult::None,
-                            };
-                            drop(elements);
-                            (search_result, new_branches)
-                        }
-                    }
+                    let search_result = search_phantom_internal_node(
+                        new_branches.as_slice(),
+                        key,
+                        &*la.elements.borrow(),
+                        |(k, _), key| k.cmp(key),
+                        |(_, v)| v,
+                        |arr| arr.unwrap_leaf().elements.borrow(),
+                    );
+                    (search_result, new_branches)
                 } else {
                     let elements = la.elements.borrow();
                     (
@@ -356,6 +320,34 @@ impl<K: Ord, V> Node<K, V> {
                     )
                 }
             }
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::type_complexity)]
+fn search_phantom_internal_node<I, K: Ord, V>(
+    branches: &[Branch<K, V>],
+    key: &K,
+    first_child: &ArrayVec<I, B>,
+    item_comparator: fn(&I, &K) -> Ordering,
+    item_extractor: fn(&I) -> &V,
+    array_extractor: fn(&Array<K, V>) -> Ref<Box<ArrayVec<I, B>>>,
+) -> SearchResult<V> {
+    match branches.binary_search_by(|b| b.key.cmp(key)) {
+        Ok(_) => SearchResult::HeadOfBranch,
+        Err(0) => match first_child.binary_search_by(|item| item_comparator(item, key)) {
+            Ok(i) => SearchResult::Some(item_extractor(&first_child[i])),
+            _ => SearchResult::None,
+        },
+        Err(i) => {
+            let elements = array_extractor(&branches[i - 1].child.array);
+            let search_result = match elements.binary_search_by(|item| item_comparator(item, key)) {
+                Ok(i) => SearchResult::Some(item_extractor(&elements[i])),
+                _ => SearchResult::None,
+            };
+            drop(elements);
+            search_result
         }
     }
 }
@@ -528,6 +520,21 @@ fn process_buffer<I, K, V>(
             counter += 1;
         };
 
+        // Consumes consecutive equal items from buffer, keeping only the last
+        #[inline]
+        fn take_last_duplicate<I>(
+            mut item: I,
+            buffer: &mut Peekable<impl Iterator<Item = I>>,
+            item_comparator: fn(&I, &I) -> Ordering,
+        ) -> I {
+            while let Some(peek) = buffer.peek()
+                && item_comparator(&item, peek).is_eq()
+            {
+                item = buffer.next().unwrap();
+            }
+            item
+        }
+
         while let Some(ne) = &next_element
             && let Some(ni) = &next_insert
         {
@@ -537,13 +544,11 @@ fn process_buffer<I, K, V>(
                     next_element = elements.next();
                 }
                 Ordering::Greater => {
-                    let mut to_apply = next_insert.take().unwrap();
-                    while let Some(peek) = buffer.peek()
-                        && item_comparator(&to_apply, peek).is_eq()
-                    {
-                        to_apply = buffer.next().unwrap();
-                    }
-                    apply(to_apply);
+                    apply(take_last_duplicate(
+                        next_insert.take().unwrap(),
+                        &mut buffer,
+                        item_comparator,
+                    ));
                     next_insert = buffer.next();
                 }
                 Ordering::Equal => {
@@ -558,13 +563,7 @@ fn process_buffer<I, K, V>(
         }
 
         while let Some(ni) = next_insert {
-            let mut to_apply = ni;
-            while let Some(peek) = buffer.peek()
-                && item_comparator(&to_apply, peek).is_eq()
-            {
-                to_apply = buffer.next().unwrap();
-            }
-            apply(to_apply);
+            apply(take_last_duplicate(ni, &mut buffer, item_comparator));
             next_insert = buffer.next();
         }
 
