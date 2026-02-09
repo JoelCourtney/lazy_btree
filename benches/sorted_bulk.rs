@@ -1,4 +1,4 @@
-use lazy_btree::Map;
+use beetree::Map;
 
 fn build_lazy(n: usize) -> Map<usize, usize> {
     let mut map = Map::new();

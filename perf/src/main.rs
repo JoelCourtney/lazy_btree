@@ -1,4 +1,4 @@
-use lazy_btree::Map;
+use beetree::Map;
 
 const INSERT_EXTRA: usize = 2;
 
