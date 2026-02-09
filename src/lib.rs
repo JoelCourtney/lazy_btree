@@ -1,3 +1,5 @@
+mod vec_slicer;
+
 use std::{
     cell::{Cell, RefCell, RefMut},
     cmp::Ordering,
@@ -9,22 +11,24 @@ use std::{
 use arrayvec::ArrayVec;
 use replace_with::replace_with_or_abort;
 
+use crate::vec_slicer::{SliceThief, VecSlicer};
+
 const B: usize = 150;
 
 pub struct Map<K, V> {
-    root: RefCell<Option<Node<K, V>>>,
+    root: RefCell<Node<K, V>>,
 }
 
 impl<K, V> Map<K, V> {
     pub fn new() -> Self {
         Map {
-            root: RefCell::new(Some(Node {
+            root: RefCell::new(Node {
                 buffer: Default::default(),
                 buffer_is_sorted: Cell::new(true),
                 array: Array::Leaf(LeafArray {
                     elements: Default::default(),
                 }),
-            })),
+            }),
         }
     }
 }
@@ -37,50 +41,62 @@ impl<K, V> Default for Map<K, V> {
 
 impl<K: Ord, V> Map<K, V> {
     pub fn insert(&mut self, key: K, value: V) {
-        self.root.borrow_mut().as_mut().unwrap().insert(key, value);
+        self.root.borrow_mut().insert(key, value);
+    }
+
+    pub fn extend_from_vec(&mut self, vec: &mut Vec<(K, V)>) {
+        self.root
+            .borrow_mut()
+            .append(VecSlicer::new(vec).slice_to_end(), false)
+    }
+
+    pub fn extend_from_sorted_vec(&mut self, vec: &mut Vec<(K, V)>) {
+        self.root
+            .borrow_mut()
+            .append(VecSlicer::new(vec).slice_to_end(), true)
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
-        let mut root_borrow = self.root.borrow_mut();
-        let root = root_borrow.as_mut().unwrap();
+        let mut root = self.root.borrow_mut();
         let (mut search_result, mut new_branches) = root.search(key);
 
-        drop(root_borrow);
         while !new_branches.is_empty() {
-            let new_array = InternalArray {
-                first_child: Box::new(self.root.take().unwrap()),
-                elements: Default::default(),
-            };
-            new_branches = new_array.process_branches(new_branches.into_iter());
+            replace_with_or_abort(&mut *root, |root| {
+                let new_array = InternalArray {
+                    first_child: Box::new(root),
+                    elements: Default::default(),
+                };
+                new_branches = new_array.process_branches(new_branches.drain(..));
 
-            search_result = match search_result {
-                SearchResult::HeadOfBranch => {
-                    let search_new_array = |array: &mut ArrayVec<Branch<K, V>, B>| {
-                        let idx = array.binary_search_by(|b| b.key.cmp(key)).unwrap();
-                        &mut *array[idx].value as *mut _
-                    };
-                    match new_branches.binary_search_by(|b| b.key.cmp(key)) {
-                        Ok(_) => SearchResult::HeadOfBranch,
-                        Err(0) => SearchResult::Some(search_new_array(
-                            &mut new_array.elements.borrow_mut(),
-                        )),
-                        Err(i) => SearchResult::Some(search_new_array(
-                            &mut new_branches[i - 1]
-                                .child
-                                .array
-                                .unwrap_internal_mut()
-                                .elements
-                                .borrow_mut(),
-                        )),
+                search_result = match search_result {
+                    SearchResult::HeadOfBranch => {
+                        let search_new_array = |array: &mut ArrayVec<Branch<K, V>, B>| {
+                            let idx = array.binary_search_by(|b| b.key.cmp(key)).unwrap();
+                            &mut *array[idx].value as *mut _
+                        };
+                        match new_branches.binary_search_by(|b| b.key.cmp(key)) {
+                            Ok(_) => SearchResult::HeadOfBranch,
+                            Err(0) => SearchResult::Some(search_new_array(
+                                &mut new_array.elements.borrow_mut(),
+                            )),
+                            Err(i) => SearchResult::Some(search_new_array(
+                                &mut new_branches[i - 1]
+                                    .child
+                                    .array
+                                    .unwrap_internal_mut()
+                                    .elements
+                                    .borrow_mut(),
+                            )),
+                        }
                     }
-                }
-                sr => sr,
-            };
+                    sr => sr,
+                };
 
-            *self.root.borrow_mut() = Some(Node {
-                buffer: Default::default(),
-                buffer_is_sorted: Cell::new(true),
-                array: Array::Internal(new_array),
+                Node {
+                    buffer: Default::default(),
+                    buffer_is_sorted: Cell::new(true),
+                    array: Array::Internal(new_array),
+                }
             });
         }
 
@@ -182,7 +198,7 @@ impl<K: Ord, V> Node<K, V> {
 
     fn append(&self, thief: SliceThief<(K, V)>, is_sorted: bool) {
         let mut buffer = self.buffer.borrow_mut();
-        buffer.reserve(thief.len);
+        buffer.reserve(thief.len());
         if is_sorted
             && self.buffer_is_sorted.get()
             && let Some((front, _)) = buffer.front()
@@ -330,128 +346,13 @@ enum SearchResult<V> {
     None,
 }
 
-struct VecSlicer<'a, T> {
-    slice_start: usize,
-    current_index: usize,
-    vec: &'a mut Vec<T>,
-}
-
-impl<'a, T> VecSlicer<'a, T> {
-    fn new(vec: &'a mut Vec<T>) -> Self {
-        Self {
-            slice_start: 0,
-            current_index: 0,
-            vec,
-        }
-    }
-
-    fn advance(&mut self, count: usize) {
-        self.current_index += count;
-    }
-
-    fn slice(&mut self) -> SliceThief<T> {
-        let thief = SliceThief {
-            start: &self.vec[self.slice_start],
-            current: 0,
-            len: self.current_index - self.slice_start,
-        };
-        self.slice_start = self.current_index;
-        thief
-    }
-
-    fn take(&mut self) -> T {
-        debug_assert_eq!(self.slice_start, self.current_index);
-        let result = unsafe { (&self.vec[self.current_index] as *const T).read() };
-        self.slice_start += 1;
-        self.current_index = self.slice_start;
-        result
-    }
-
-    fn remaining(&self) -> usize {
-        self.vec.len() - self.current_index
-    }
-
-    fn current(&self) -> &T {
-        &self.vec[self.current_index]
-    }
-
-    fn slice_to_end(&mut self) -> SliceThief<T> {
-        self.current_index = self.vec.len();
-        self.slice()
+impl<V> Clone for SearchResult<V> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
 
-impl<T> Drop for VecSlicer<'_, T> {
-    fn drop(&mut self) {
-        debug_assert_eq!(self.current_index, self.vec.len());
-        debug_assert_eq!(self.slice_start, self.vec.len());
-        unsafe {
-            self.vec.set_len(0);
-        }
-    }
-}
-
-struct SliceThief<T> {
-    start: *const T,
-    current: usize,
-    len: usize,
-}
-
-impl<T> SliceThief<T> {
-    fn peek_first(&self) -> &T {
-        debug_assert_ne!(self.len, 0, "Cannot peek first element of empty slice");
-        debug_assert_eq!(
-            self.current, 0,
-            "Cannot peek first element when it has already been consumed."
-        );
-        unsafe { &*self.start }
-    }
-
-    fn peek_last(&self) -> &T {
-        debug_assert_ne!(self.len, 0, "Cannot peek last element of empty slice");
-        debug_assert_ne!(
-            self.current, self.len,
-            "Cannot peek last element when it has already been consumed."
-        );
-        unsafe { &*self.start.add(self.len - 1) }
-    }
-}
-
-impl<T> Drop for SliceThief<T> {
-    fn drop(&mut self) {
-        debug_assert_eq!(self.current, self.len);
-    }
-}
-
-impl<T> Iterator for SliceThief<T> {
-    type Item = T;
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.len, Some(self.len))
-    }
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current < self.len {
-            let result = unsafe { Some(self.start.add(self.current).read()) };
-            self.current += 1;
-            result
-        } else {
-            None
-        }
-    }
-}
-
-impl<T> ExactSizeIterator for SliceThief<T> {}
-
-impl<T> DoubleEndedIterator for SliceThief<T> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.current < self.len {
-            self.len -= 1;
-            unsafe { Some(self.start.add(self.len).read()) }
-        } else {
-            None
-        }
-    }
-}
+impl<V> Copy for SearchResult<V> {}
 
 impl<K: Ord, V> InternalArray<K, V> {
     fn push_down(&self, buffer: &mut Vec<(K, V)>) {
@@ -521,9 +422,7 @@ impl<K: Ord, V> InternalArray<K, V> {
                 let push_to = match &child.array {
                     Array::Internal(ia) => {
                         let mut elem_borrow = ia.elements.borrow_mut();
-                        let ptr = &mut **elem_borrow as *mut _;
-                        drop(elem_borrow);
-                        ptr
+                        &mut **elem_borrow as *mut _
                     }
                     _ => unreachable!(),
                 };
@@ -550,9 +449,7 @@ impl<K: Ord, V> LeafArray<K, V> {
                 let push_to = match &child.array {
                     Array::Leaf(la) => {
                         let mut elem_borrow = la.elements.borrow_mut();
-                        let ptr = &mut **elem_borrow as *mut _;
-                        drop(elem_borrow);
-                        ptr
+                        &mut **elem_borrow as *mut _
                     }
                     _ => unreachable!(),
                 };
