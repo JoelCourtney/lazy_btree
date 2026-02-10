@@ -24,5 +24,5 @@ members = [".", "perf"]
 default-members = [".", "perf"]
 
 [dependencies]
-arrayvec = "0.7.6"
+arrayvec = "0.7"
 replace_with = "0.1.8"

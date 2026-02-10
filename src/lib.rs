@@ -1,5 +1,5 @@
-mod vec_slicer;
 mod get;
+mod vec_slicer;
 
 use std::{
     cell::{Cell, RefCell, RefMut},
@@ -200,8 +200,22 @@ struct LeafArray<K, V> {
 
 struct Branch<K, V> {
     key: K,
+    stable_deref_key: Option<Box<K>>,
     value: MaybeBox<V>,
     child: Box<Node<K, V>>,
+}
+
+impl<K: Clone, V> Branch<K, V> {
+    fn boxify_key(&mut self) -> *const K {
+        if let Some(k) = &self.stable_deref_key {
+            k.as_ref() as *const _
+        } else {
+            let k = Box::new(self.key.clone());
+            let result = k.as_ref() as *const _;
+            self.stable_deref_key = Some(k);
+            result
+        }
+    }
 }
 
 enum MaybeBox<V> {
@@ -391,6 +405,7 @@ impl<K: Ord, V> LeafArray<K, V> {
                 (
                     Branch {
                         key,
+                        stable_deref_key: None,
                         value: MaybeBox::Inline(value),
                         child,
                     },
